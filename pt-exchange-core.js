@@ -1,6 +1,11 @@
 /* =========================================================================
- * PT Exchange Core v1.0.1
+ * PT Exchange Core v1.0.2
  * 共享核心库：主题 / UI / 自动兑换 / 历史 / 配置存储 / 工具
+ *
+ * v1.0.2 修复：
+ *   - [Fix]  savePendingExchange 在"覆盖已有 pending"时累加期望 sizeGB，
+ *           并保留最早的 uploadGB 作为比对基准。解决 Livewire 局部刷新
+ *           期间多次点击导致 banner 显示"增加 N GB（期望 1 份 GB）"的误解。
  *
  * v1.0.1 修复：
  *   - [Bug]  多并列最佳时点击非首个卡片错误弹出 qtyInput 提示
@@ -28,7 +33,7 @@
     var DEFAULT_RESERVE_BONUS = 0;
     var DEFAULT_THEME = 'cyber';
     var DEFAULT_PANEL_ID = 'exchange-assistant-panel';
-    var PANEL_CLASS = 'kf-exchange-panel';   // 固定 class，用于 CSS 选择器
+    var PANEL_CLASS = 'kf-exchange-panel';
 
     var STORAGE_AUTO_CONFIG = 'exchange_auto_config';
     var STORAGE_AUTO_CONFIG_PREFIX = 'exchange_auto_config::';
@@ -98,9 +103,6 @@
         return (link && link.href) ? link.href : (window.location.origin + '/favicon.ico');
     }
 
-    // ============================================================
-    // siteKey：[Fix] 优先使用 host（保证唯一），无 host 时回落到 name
-    // ============================================================
     function siteKey(prefix, siteConfig) {
         var id;
         if (siteConfig && siteConfig.host) {
@@ -108,7 +110,6 @@
         } else if (siteConfig && siteConfig.name) {
             id = String(siteConfig.name).toLowerCase().replace(/\s+/g, '_');
         } else {
-            // 最终回落到 location.hostname，避免 '__global__' 互相覆盖
             id = (window.location && window.location.hostname) || '__global__';
         }
         return prefix + id;
@@ -119,9 +120,9 @@
     function formatTime(ts) { return new Date(ts).toLocaleString('zh-CN', { hour12: false }); }
 
     // ============================================================
-    // 自动兑换配置（[Opt] 增加内存缓存）
+    // 自动兑换配置（含内存缓存）
     // ============================================================
-    var _autoCfgCache = {};   // { key: cfgObj }
+    var _autoCfgCache = {};
 
     function getAutoConfig(siteConfig, siteDefaultReserve, siteDefaultInterval, lockInterval) {
         var key = siteKey(STORAGE_AUTO_CONFIG_PREFIX, siteConfig);
@@ -150,7 +151,6 @@
 
     function saveAutoConfig(siteConfig, c) {
         try { localStorage.setItem(siteKey(STORAGE_AUTO_CONFIG_PREFIX, siteConfig), JSON.stringify(c)); } catch (e) {}
-        // 失效缓存
         var prefix = siteKey(STORAGE_AUTO_CONFIG_PREFIX, siteConfig);
         Object.keys(_autoCfgCache).forEach(function (k) {
             if (k.indexOf(prefix + '|') === 0) delete _autoCfgCache[k];
@@ -228,7 +228,38 @@
     // 历史记录 / Pending
     // ============================================================
     function getPendingExchange() { try { var d = localStorage.getItem(STORAGE_PENDING); return d ? JSON.parse(d) : null; } catch (e) { return null; } }
-    function savePendingExchange(r) { try { localStorage.setItem(STORAGE_PENDING, JSON.stringify(r)); } catch (e) {} }
+
+    // ============================================================
+    // [Fix v1.0.2] savePendingExchange：
+    //   1. 累加期望 sizeGB —— 让 banner「（期望 N GB）」反映累计值
+    //   2. 保留最早的 uploadGB 作基准 —— 确保差值 = 累计增量
+    //   3. 保留最早的 timestamp —— 统一 1 小时超时窗口
+    // ============================================================
+    function savePendingExchange(r) {
+        try {
+            var existing = getPendingExchange();
+            if (existing
+                && existing.site === r.site
+                && (Date.now() - existing.timestamp) < 60 * 60 * 1000) {   // 1 小时内
+                // 1. 保留更早（更小）的 uploadGB
+                if (typeof existing.uploadGB === 'number'
+                    && typeof r.uploadGB === 'number'
+                    && existing.uploadGB < r.uploadGB) {
+                    r.uploadGB = existing.uploadGB;
+                }
+                // 2. 累加期望 sizeGB
+                if (existing.option && typeof existing.option.sizeGB === 'number') {
+                    var newSize = (r.option && typeof r.option.sizeGB === 'number') ? r.option.sizeGB : 0;
+                    r.option = r.option || {};
+                    r.option.sizeGB = existing.option.sizeGB + newSize;
+                }
+                // 3. 保留最早时间戳
+                r.timestamp = existing.timestamp;
+            }
+            localStorage.setItem(STORAGE_PENDING, JSON.stringify(r));
+        } catch (e) {}
+    }
+
     function clearPendingExchange() { try { localStorage.removeItem(STORAGE_PENDING); } catch (e) {} }
 
     function getHistory(site) {
@@ -245,15 +276,9 @@
         try { localStorage.setItem(STORAGE_HISTORY, JSON.stringify(h)); } catch (e) {}
     }
 
-    // ============================================================
-    // checkPendingExchange：[Fix] 增加站点校验，避免跨站误判
-    //   调用方需传入 currentSite（推荐传 config.name 或 config.host）
-    //   如果不传，保持向后兼容，仅做时间/增量校验
-    // ============================================================
     function checkPendingExchange(currentUploadGB, currentSite) {
         var pending = getPendingExchange(); if (!pending) return null;
         if (Date.now() - pending.timestamp > PENDING_TIMEOUT) { clearPendingExchange(); return null; }
-        // 站点不匹配：直接跳过（不清除 pending，避免影响原本站点的检测）
         if (currentSite && pending.site && currentSite !== pending.site) return null;
         var inc = currentUploadGB - pending.uploadGB;
         if (inc > 0.01) {
@@ -321,8 +346,7 @@
     }
 
     // ============================================================
-    // 主题样式注入
-    //   [Opt] 所有 #exchange-assistant-panel 已改为 .kf-exchange-panel
+    // 主题样式注入（完整 CSS，与 v1.0.1 一致）
     // ============================================================
     function injectThemeStyles() {
         if (document.getElementById('kf-theme-styles')) return;
@@ -844,10 +868,7 @@
     }
 
     // ============================================================
-    // injectUI（v1.0.1 修复版）
-    //   [Fix] 多并列最佳时，仅 index===0 的按钮走 qtyInput 逻辑
-    //   [Opt] 兜底插入 body 时改为 appendChild，避免面板跑到页面顶部
-    //   [Opt] 面板带 .kf-exchange-panel class，避免多脚本 ID 冲突
+    // injectUI（与 v1.0.1 一致）
     // ============================================================
     function injectUI(config, userData, strategy) {
         if (DEBUG) log('[' + config.name + '助手] 开始注入UI...');
@@ -861,7 +882,6 @@
         var oldPanel = document.getElementById(panelId);
         if (oldPanel) oldPanel.remove();
 
-        // ---------- 面板插入位置解析 ----------
         var outer, insertBeforeNode, insertResolved = false, useAppend = false;
         if (config.panelInsertBefore) {
             var t1 = document.querySelector(config.panelInsertBefore);
@@ -891,7 +911,6 @@
             if (outer) {
                 insertBeforeNode = outer.firstChild;
             } else {
-                // [Opt] 最终兜底：body 用 appendChild，避免插到 <script>/<comment> 之前
                 outer = document.body;
                 useAppend = true;
             }
@@ -1106,7 +1125,6 @@
             + '<div id="kf-options-list"></div>' + historyHTML
             + '<div class="kf-footer">💡 最佳选项根据 MB/单位 性价比自动计算' + (isMultiBest ? '，多个并列最佳均已标注' : '') + '</div>';
 
-        // ---------- 插入面板 ----------
         if (useAppend) {
             outer.appendChild(panel);
         } else {
@@ -1125,7 +1143,6 @@
             if (pStyle.display === 'flex' || pStyle.display === 'inline-flex') outer.style.setProperty('flex-wrap', 'wrap', 'important');
         } catch (e) {}
 
-        // ---------- 输入框尺寸统一 ----------
         var forceInputSizes = function () {
             var themeClasses = panel.className;
             var ctrlBg, ctrlColor, ctrlBorder, ctrlBoxShadow;
@@ -1200,7 +1217,6 @@
         var select = document.getElementById('kf-theme-select');
         if (select && !config.hideThemeSelect) select.addEventListener('change', function () { switchTheme(panel, this.value); });
 
-        // ---------- 自动兑换 / H&R 配置交互 ----------
         var enableCheckbox = document.getElementById('kf-auto-enable');
         var intervalInput = document.getElementById('kf-auto-interval');
         var reserveInput = document.getElementById('kf-reserve-bonus');
@@ -1309,7 +1325,6 @@
         var arrow = document.getElementById('kf-history-arrow');
         if (toggle && content && arrow) toggle.addEventListener('click', function () { var isOpen = content.classList.toggle('open'); arrow.classList.toggle('open', isOpen); });
 
-        // ---------- 历史记录渲染 ----------
         (function renderHistory() {
             var body = document.getElementById('kf-history-body'); if (!body) return;
             var PAGE_SIZE = 10; var page = 0;
@@ -1334,7 +1349,6 @@
             render();
         })();
 
-        // ---------- 兑换按钮（含 Bug 1 修复） ----------
         panel.querySelectorAll('.kf-best-card .kf-btn-primary[data-best-index]').forEach(function (btn) {
             var index = parseInt(btn.dataset.bestIndex, 10);
             var best = bestOptions[index];
@@ -1343,8 +1357,6 @@
                 e.preventDefault();
                 if (window._countdownInterval) { clearInterval(window._countdownInterval); window._countdownInterval = null; var ts = document.getElementById('kf-countdown-timer'); if (ts) ts.textContent = '--'; if (stopReason) stopReason.style.display = 'none'; }
                 savePendingExchange({ site: config.name, uploadGB: userData.uploadGB, option: { sizeGB: best.sizeGB, price: best.price, efficiency: best.efficiency, desc: best.desc }, timestamp: Date.now() });
-
-                // [Fix] 仅 index===0 的卡片带 kf-qty-input；其他索引走 default click
                 if (config.qtyInput && index === 0) {
                     var qtyEl = document.getElementById('kf-qty-input');
                     var qty = qtyEl ? parseInt(qtyEl.value, 10) : 0;
@@ -1360,7 +1372,6 @@
             });
         });
 
-        // ---------- 非最佳选项列表 ----------
         var optionsList = document.getElementById('kf-options-list');
         var bestSizeSet = {};
         bestOptions.forEach(function (o) { bestSizeSet[o.sizeGB] = true; });
@@ -1387,7 +1398,6 @@
             }
         });
 
-        // ---------- 进度条动画 ----------
         setTimeout(function () {
             panel.querySelectorAll('.kf-progress-fill').forEach(function (fill) {
                 var targetWidth = fill.style.width;
@@ -1396,7 +1406,6 @@
             });
         }, 100);
 
-        // ---------- 高亮原生行 ----------
         bestOptions.forEach(function (best) {
             if (best.row && best.row.tagName === 'TR') {
                 best.row.style.cssText = 'background: linear-gradient(90deg, rgba(251,191,36,0.08) 0%, rgba(251,191,36,0.02) 100%) !important; border-left: 3px solid #fbbf24 !important; transition: all 0.3s;';
@@ -1407,7 +1416,6 @@
             }
         });
 
-        // ---------- 效率小徽章 ----------
         strategy.allOptions.forEach(function (opt) {
             if (opt.price <= 0) return;
             var insertContainer = opt.priceCell || null;
@@ -1448,7 +1456,7 @@
     }
 
     // ============================================================
-    // scheduleAutoExchange（完整）
+    // scheduleAutoExchange（与 v1.0.1 一致）
     // ============================================================
     function scheduleAutoExchange(config, currentBonus, minPrice) {
         var cfg = getAutoConfig(config, config.defaultReserveBonus, config.defaultAutoInterval, config.lockAutoInterval);
@@ -1548,7 +1556,7 @@
     }
 
     // ============================================================
-    // 版本校验工具（供主脚本调用）
+    // 版本校验工具
     // ============================================================
     function assertVersion(minVersion) {
         if (!minVersion) return true;
@@ -1557,10 +1565,10 @@
                 return acc + (parseInt(n, 10) || 0) * Math.pow(1000, 2 - i);
             }, 0);
         }
-        var cur = toNum('1.0.1');
+        var cur = toNum('1.0.2');
         var need = toNum(minVersion);
         if (cur < need) {
-            console.error('[PT Exchange Core] 版本不匹配：期望 ≥ ' + minVersion + '，实际 1.0.1。请升级 @require 中的 CDN 版本号。');
+            console.error('[PT Exchange Core] 版本不匹配：期望 ≥ ' + minVersion + '，实际 1.0.2。请升级 @require 中的 CDN 版本号。');
             return false;
         }
         return true;
@@ -1570,7 +1578,7 @@
     // 对外暴露 API
     // ============================================================
     W.KFExchange = {
-        version: '1.0.1',
+        version: '1.0.2',
         DEBUG: DEBUG,
         log: log,
 
@@ -1625,6 +1633,6 @@
         assertVersion: assertVersion
     };
 
-    log('[PT Exchange Core] v1.0.1 已加载');
+    log('[PT Exchange Core] v1.0.2 已加载');
 
 })();
